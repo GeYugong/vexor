@@ -87,7 +87,7 @@ Useful for CI warmup or when `auto_index` is disabled.
 Vexor can also be imported and used directly from Python:
 
 ```python
-from vexor import index, search
+from vexor import index, search, search_many
 
 index(path=".", mode="head")
 response = search("config loader", path=".", mode="name")

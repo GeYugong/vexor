@@ -50,9 +50,10 @@ uv sync --extra local
 uv run --extra local python scripts/benchmark_batch_search.py
 ```
 
-This uses synthetic documents in temporary cache directories and checks file,
-in-memory, and filtered collection results for equivalence under dense and
-hybrid ranking. It reports elapsed time and real embedding backend call counts;
+This uses synthetic documents in temporary cache directories. File and filtered
+collection results are checked for equivalence under dense (`off`) and hybrid
+ranking; the in-memory comparison covers hybrid only.
+It reports elapsed time and real embedding backend call counts;
 model/index warmup is excluded and each persisted arm starts with a cold query
 cache. It uses `intfloat/multilingual-e5-small` by default (`--model` overrides
 it). Download the model first for an offline run, then set `HF_HUB_OFFLINE=1`.

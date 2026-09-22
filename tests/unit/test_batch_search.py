@@ -2,26 +2,35 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from sqlite3 import Connection
+from typing import TypedDict
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 import vexor
 from vexor import api, cache, collection_store
+from vexor.config import RemoteRerankConfig
 from vexor.search import VexorSearcher
 from vexor.services import collection_service, search_service
 from vexor.services.query_service import validate_embedding_vectors
+from vexor.services.search_service import SearchResponse
 
 
 class BatchBackend:
+    """Return deterministic vectors and retain every embedding request for assertions."""
+
     def __init__(self) -> None:
+        """Start with an empty embedding-call history."""
         self.calls: list[list[str]] = []
 
-    def embed(self, texts: Sequence[str]) -> np.ndarray:
+    def embed(self, texts: Sequence[str]) -> NDArray[np.float32]:
+        """Map each query or document to one of three known unit vectors."""
         self.calls.append(list(texts))
         return np.array([
             [1.0, 0.0, 0.0] if "alpha" in text.lower()
@@ -31,11 +40,29 @@ class BatchBackend:
         ], dtype=np.float32)
 
 
+Corpus = tuple[Path, BatchBackend]
+
+
+class FileOptions(TypedDict, total=False):
+    """Keyword arguments shared by the file API test cases."""
+
+    path: Path
+    mode: str
+    provider: str
+    model: str
+    use_config: bool
+    config: dict[str, object]
+    temporary_index: bool
+    no_cache: bool
+
+
 @pytest.fixture
-def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Corpus]:
+    """Provide a real temporary corpus and a deterministic recording backend."""
     backend = BatchBackend()
 
-    def create_backend(searcher):
+    def create_backend(searcher: VexorSearcher) -> BatchBackend:
+        """Reuse the recording backend across all searcher instances."""
         searcher._device = "batch-test"
         return backend
 
@@ -54,12 +81,14 @@ def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cache._clear_embedding_memory_cache()
 
 
-def file_options(root: Path, rerank: str = "off") -> dict:
+def file_options(root: Path, rerank: str = "off") -> FileOptions:
+    """Build explicit file options without consulting user configuration."""
     return {"path": root, "mode": "full", "provider": "local", "model": "batch-model",
             "use_config": False, "config": {"rerank": rerank}}
 
 
-def make_collection(client: api.VexorClient):
+def make_collection(client: api.VexorClient) -> api.CollectionHandle:
+    """Populate records in two tenants for filtered retrieval assertions."""
     handle = client.collection("records", provider="local", model="batch-model")
     handle.upsert_many([
         {"id": "a", "text": "alpha document", "metadata": {"tenant": "allowed"}},
@@ -71,14 +100,22 @@ def make_collection(client: api.VexorClient):
 
 @pytest.mark.parametrize("entry", ["module", "client", "temporary", "no_cache", "memory"])
 @pytest.mark.parametrize("rerank", ["off", "hybrid", "bm25", "flashrank", "remote"])
-def test_batch_matches_single_queries_and_embeds_once(corpus, monkeypatch, entry, rerank):
+def test_batch_matches_single_queries_and_embeds_once(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch, entry: str, rerank: str
+) -> None:
+    """Preserve each ranking strategy while embedding unique queries together."""
     root, backend = corpus
-    monkeypatch.setattr(search_service, "_rank_documents_flashrank",
-                        lambda q, docs, model: [(i, float(len(docs) - i))
-                                               for i in range(len(docs))])
-    monkeypatch.setattr(search_service, "_rank_documents_remote",
-                        lambda q, docs, config: [(i, float(len(docs) - i))
-                                                for i in range(len(docs))])
+
+    def rank_documents(
+        query: str, documents: Sequence[str], config: str | RemoteRerankConfig | None
+    ) -> list[tuple[int, float]]:
+        """Keep candidate order fixed without loading or calling an external reranker."""
+        return [(i, float(len(documents) - i)) for i in range(len(documents))]
+
+    monkeypatch.setattr(search_service, "_rank_documents_flashrank", rank_documents)
+    monkeypatch.setattr(search_service, "_rank_documents_remote", rank_documents)
+    batch: Callable[..., list[SearchResponse]]
+    single: Callable[..., SearchResponse]
     options = file_options(root, rerank)
     queries = [" alpha query ", "beta query", "alpha query"]
     with api.VexorClient(use_config=False) as client:
@@ -110,7 +147,10 @@ def test_batch_matches_single_queries_and_embeds_once(corpus, monkeypatch, entry
             assert not (cache.CACHE_DIR / "index.db").exists()
 
 
-def test_persisted_batch_prepares_index_only_once(corpus, monkeypatch):
+def test_persisted_batch_prepares_index_only_once(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Load and validate the persisted file corpus only once per batch."""
     root, _ = corpus
     api.index(**file_options(root))
     load = Mock(wraps=cache.load_index_vectors)
@@ -122,7 +162,8 @@ def test_persisted_batch_prepares_index_only_once(corpus, monkeypatch):
     assert freshness.call_count == 1
 
 
-def test_mixed_query_and_shared_cache_hits_only_embed_misses(corpus):
+def test_mixed_query_and_shared_cache_hits_only_embed_misses(corpus: Corpus) -> None:
+    """Combine both cache layers and embed only the remaining query."""
     root, backend = corpus
     opts = file_options(root)
     api.index(**opts)
@@ -140,7 +181,10 @@ def test_mixed_query_and_shared_cache_hits_only_embed_misses(corpus):
     assert backend.calls == []
 
 
-def test_stale_batch_rebuilds_once_and_filters(corpus, monkeypatch):
+def test_stale_batch_rebuilds_once_and_filters(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refresh a changed corpus once while retaining file filters."""
     from vexor.services import index_service
 
     root, _ = corpus
@@ -161,7 +205,10 @@ def test_stale_batch_rebuilds_once_and_filters(corpus, monkeypatch):
 @pytest.mark.parametrize("entry", ["module", "client", "memory", "collection"])
 @pytest.mark.parametrize("queries", ["alpha", b"alpha", ["alpha", " "], ["alpha", None],
                                      ["alpha", 1], {"alpha"}, iter(["alpha"])])
-def test_invalid_batch_fails_before_any_provider_call(corpus, entry, queries):
+def test_invalid_batch_fails_before_any_provider_call(
+    corpus: Corpus, entry: str, queries: object
+) -> None:
+    """Reject malformed query sequences before generating any embeddings."""
     root, backend = corpus
     with api.VexorClient(use_config=False) as client:
         if entry == "memory":
@@ -179,7 +226,10 @@ def test_invalid_batch_fails_before_any_provider_call(corpus, entry, queries):
         assert not backend.calls
 
 
-def test_empty_batch_does_not_resolve_paths_config_or_models(corpus, tmp_path):
+def test_empty_batch_does_not_resolve_paths_config_or_models(
+    corpus: Corpus, tmp_path: Path
+) -> None:
+    """Return an empty batch without filesystem or provider side effects."""
     _, backend = corpus
     absent = tmp_path / "absent"
     assert vexor.search_many([], path=absent, data_dir=absent) == []
@@ -190,7 +240,8 @@ def test_empty_batch_does_not_resolve_paths_config_or_models(corpus, tmp_path):
     assert not backend.calls
 
 
-def test_empty_corpus_returns_one_distinct_empty_response_per_query(corpus):
+def test_empty_corpus_returns_one_distinct_empty_response_per_query(corpus: Corpus) -> None:
+    """Preserve query positions when no documents can be indexed."""
     root, backend = corpus
     empty = root / "empty"
     empty.mkdir()
@@ -204,14 +255,18 @@ def test_empty_corpus_returns_one_distinct_empty_response_per_query(corpus):
 
 
 @pytest.mark.parametrize("rerank", ["off", "hybrid", "bm25", "flashrank", "remote"])
-def test_collection_batch_shares_snapshot_and_reranks_after_close(corpus, monkeypatch, rerank):
+def test_collection_batch_shares_snapshot_and_reranks_after_close(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch, rerank: str
+) -> None:
+    """Retrieve all queries in one filtered snapshot and rerank after it closes."""
     _, backend = corpus
     active = False
     snapshots = 0
     original = collection_store.read_snapshot
 
     @contextmanager
-    def snapshot():
+    def snapshot() -> Iterator[Connection | None]:
+        """Track the lifetime of the actual SQLite read transaction."""
         nonlocal active, snapshots
         with original() as conn:
             snapshots += 1
@@ -221,7 +276,10 @@ def test_collection_batch_shares_snapshot_and_reranks_after_close(corpus, monkey
             finally:
                 active = False
 
-    def rank(query, documents, config):
+    def rank(
+        query: str, documents: Sequence[str], config: str | RemoteRerankConfig | None
+    ) -> list[tuple[int, float]]:
+        """Reject reranking while a read snapshot remains open."""
         assert not active
         return [(i, float(len(documents) - i)) for i in range(len(documents))]
 
@@ -244,14 +302,23 @@ def test_collection_batch_shares_snapshot_and_reranks_after_close(corpus, monkey
         assert results == [handle.search(q, **opts) for q in queries]
 
 
-def test_collection_batch_filters_use_one_snapshot_during_concurrent_write(corpus, monkeypatch):
+def test_collection_batch_filters_use_one_snapshot_during_concurrent_write(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep tenant filters consistent when a concurrent writer changes metadata."""
     with api.VexorClient(use_config=False) as client:
         handle = make_collection(client)
         original = collection_store.load_vectors
 
-        def racing_load(*args):
+        def racing_load(
+            collection_id: int,
+            record_ids: Sequence[int],
+            dimension: int,
+            conn: Connection | None = None,
+        ) -> tuple[list[int], NDArray[np.float32]]:
+            """Move a record across tenants after filtering but before vector loading."""
             handle.upsert("a", "alpha document", {"tenant": "other"})
-            return original(*args)
+            return original(collection_id, record_ids, dimension, conn)
 
         monkeypatch.setattr(collection_store, "load_vectors", racing_load)
         results = handle.search_many(["alpha query", "beta query"],
@@ -267,7 +334,10 @@ def test_collection_batch_filters_use_one_snapshot_during_concurrent_write(corpu
                                  [[1, 0, 0], [np.inf, 0, 0]],
                                  [[1, 0], [1]], [["bad"], ["bad"]]])
 @pytest.mark.parametrize("entry", ["file", "collection"])
-def test_invalid_provider_batch_is_never_retried_or_cached(corpus, monkeypatch, bad, entry):
+def test_invalid_provider_batch_is_never_retried_or_cached(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch, bad: object, entry: str
+) -> None:
+    """Reject malformed embedding responses without retrying or caching them."""
     root, backend = corpus
     with api.VexorClient(use_config=False) as client:
         if entry == "file":
@@ -286,7 +356,10 @@ def test_invalid_provider_batch_is_never_retried_or_cached(corpus, monkeypatch, 
         assert cache.load_embedding_cache("batch-model", hashes) == {}
 
 
-def test_batch_propagates_provider_failure_without_partial_results(corpus, monkeypatch):
+def test_batch_propagates_provider_failure_without_partial_results(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Surface a provider failure instead of returning partial results."""
     root, backend = corpus
     api.index(**file_options(root))
     monkeypatch.setattr(backend, "embed", Mock(side_effect=RuntimeError("provider unavailable")))
@@ -294,7 +367,8 @@ def test_batch_propagates_provider_failure_without_partial_results(corpus, monke
         api.search_many(["alpha query", "beta query"], **file_options(root))
 
 
-def test_batch_content_budgets_are_independent(corpus):
+def test_batch_content_budgets_are_independent(corpus: Corpus) -> None:
+    """Apply the content limit separately to each query, including duplicates."""
     root, _ = corpus
     responses = api.search_many(["alpha", "beta", "alpha"], include_content=True,
                                 content_chars_total=220, **file_options(root))
@@ -308,7 +382,10 @@ def test_batch_content_budgets_are_independent(corpus):
 
 
 @pytest.mark.parametrize("entry", ["module", "client"])
-def test_batch_resolves_configuration_once(corpus, monkeypatch, entry):
+def test_batch_resolves_configuration_once(
+    corpus: Corpus, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    """Resolve configuration once and preserve client cache resources."""
     root, _ = corpus
     load = Mock(return_value=api.Config(provider="local", model="batch-model", rerank="hybrid"))
     monkeypatch.setattr(api, "load_config", load)
@@ -332,7 +409,8 @@ def test_batch_resolves_configuration_once(corpus, monkeypatch, entry):
             assert request.freshness_tracker is client._freshness_tracker
 
 
-def test_empty_memory_batch_and_empty_collection_filter(corpus):
+def test_empty_memory_batch_and_empty_collection_filter(corpus: Corpus) -> None:
+    """Keep empty batches and empty filtered subsets distinct."""
     root, backend = corpus
     with api.VexorClient(use_config=False) as client:
         index = client.index_in_memory(**file_options(root))
@@ -345,7 +423,8 @@ def test_empty_memory_batch_and_empty_collection_filter(corpus):
         assert results[0] is not results[1]
 
 
-def test_embedding_normalization_does_not_overflow():
+def test_embedding_normalization_does_not_overflow() -> None:
+    """Normalize large finite vectors without overflowing float32 norms."""
     backend = Mock()
     backend.embed.return_value = np.array([[3e38, 3e38]], dtype=np.float32)
     matrix = VexorSearcher(backend=backend).embed_texts(["query"])

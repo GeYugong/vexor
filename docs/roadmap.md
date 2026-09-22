@@ -171,6 +171,13 @@ never leaving the machine.
 
 ## Engineering TODO
 
+- Harden `embed_texts_with_cache` for its indexing and collection-upsert
+  consumers by validating the assembled batch, including cache hits. Add
+  regression tests for cached non-finite values and incompatible vector widths,
+  with both full cache hits and mixed hits/misses. This unchecked shared-helper
+  path predates batch search; file queries already reject invalid cache hits
+  and collection queries validate the assembled matrix. See the
+  [PR #70 review](https://github.com/scarletkc/vexor/pull/70#pullrequestreview-5279489107).
 - Add a dev-only consistency test that validates the MCP tool
   `inputSchema` against the server-side argument validation (feed
   known-good/bad payloads through both), so the advertised schema and the

@@ -9,15 +9,23 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
+from typing import Literal, TypeVar
 from unittest.mock import patch
 
 import numpy as np
+from numpy.typing import NDArray
 
-from vexor import VexorClient
+from vexor import RecordResult, VexorClient
 from vexor.providers.local import LocalEmbeddingBackend
+from vexor.services.search_service import SearchResponse
+
+T = TypeVar("T")
+BenchmarkResponse = SearchResponse | list[RecordResult]
+ARMS: tuple[Literal["single", "batch"], ...] = ("single", "batch")
 
 DOCUMENTS = {
     "authentication.txt": "Validate login passwords and issue authentication tokens.",
@@ -30,11 +38,13 @@ QUERIES = [
 ]
 
 
-def measure(operation: Callable, *, label: str) -> object:
+def measure(operation: Callable[[], T], *, label: str) -> T:
+    """Measure elapsed time and real embedding calls without replacing their results."""
     calls: list[int] = []
     original = LocalEmbeddingBackend.embed
 
-    def counted(backend: LocalEmbeddingBackend, texts: Sequence[str]) -> np.ndarray:
+    def counted(backend: LocalEmbeddingBackend, texts: Sequence[str]) -> NDArray[np.float32]:
+        """Record the request size and invoke the real local backend."""
         calls.append(len(texts))
         return original(backend, texts)
 
@@ -46,33 +56,50 @@ def measure(operation: Callable, *, label: str) -> object:
     return result
 
 
-def assert_equivalent(single: list, batch: list, *, records: bool = False) -> None:
+def assert_equivalent(
+    single: Sequence[BenchmarkResponse], batch: Sequence[BenchmarkResponse]
+) -> None:
+    """Compare ordered identities, scores, and source data for each query."""
     assert len(single) == len(batch) == len(QUERIES)
     for left, right in zip(single, batch, strict=True):
-        if not records:
-            left, right = left.results, right.results
-        keys_left = [item.id if records else item.path.name for item in left]
-        keys_right = [item.id if records else item.path.name for item in right]
-        assert keys_left == keys_right, (keys_left, keys_right)
-        np.testing.assert_allclose(
-            [item.score for item in left], [item.score for item in right], atol=1e-5,
-        )
-        if records:
-            assert [item.metadata for item in left] == [item.metadata for item in right]
+        if isinstance(left, SearchResponse):
+            assert isinstance(right, SearchResponse)
+            keys_left = [item.path.name for item in left.results]
+            keys_right = [item.path.name for item in right.results]
+            scores_left = [item.score for item in left.results]
+            scores_right = [item.score for item in right.results]
+            assert [item.content for item in left.results] == [
+                item.content for item in right.results
+            ]
         else:
-            assert [item.content for item in left] == [item.content for item in right]
+            assert isinstance(right, list)
+            keys_left = [item.id for item in left]
+            keys_right = [item.id for item in right]
+            scores_left = [item.score for item in left]
+            scores_right = [item.score for item in right]
+            assert [item.metadata for item in left] == [item.metadata for item in right]
+        assert keys_left == keys_right, (keys_left, keys_right)
+        np.testing.assert_allclose(scores_left, scores_right, atol=1e-5)
 
 
-def measure_queries(target, arm: str, options: dict, label: str) -> list:
-    def operation() -> list:
+def measure_queries(
+    single: Callable[[str], T],
+    batch: Callable[[Sequence[str]], list[T]],
+    arm: Literal["single", "batch"],
+    label: str,
+) -> list[T]:
+    """Measure either query strategy using callables with options already bound."""
+    def operation() -> list[T]:
+        """Run the selected strategy against the same fixed query list."""
         if arm == "single":
-            return [target.search(query, **options) for query in QUERIES]
-        return target.search_many(QUERIES, **options)
+            return [single(query) for query in QUERIES]
+        return batch(QUERIES)
 
     return measure(operation, label=label)
 
 
 def run(model: str) -> None:
+    """Compare five ranking/surface combinations using isolated synthetic corpora."""
     with TemporaryDirectory(prefix="vexor-batch-") as temporary:
         base = Path(temporary)
         root = base / "documents"
@@ -82,17 +109,18 @@ def run(model: str) -> None:
         config = {"provider": "local", "model": model, "rerank": "off"}
         for rerank in ("off", "hybrid"):
             config["rerank"] = rerank
-            arms: dict[str, list] = {}
-            for arm in ("single", "batch"):
+            file_arms: dict[str, list[SearchResponse]] = {}
+            for arm in ARMS:
                 with VexorClient(cache_dir=base / f"{rerank}-{arm}") as client:
                     client.set_config_json(config, replace=True)
-                    options = {"path": root, "mode": "full"}
-                    client.index(**options)
-                    arms[arm] = measure_queries(
-                        client, arm, {**options, "include_content": True},
+                    client.index(path=root, mode="full")
+                    file_arms[arm] = measure_queries(
+                        partial(client.search, path=root, mode="full", include_content=True),
+                        partial(client.search_many, path=root, mode="full", include_content=True),
+                        arm,
                         f"files/{rerank}/{arm}",
                     )
-            assert_equivalent(arms["single"], arms["batch"])
+            assert_equivalent(file_arms["single"], file_arms["batch"])
 
         with VexorClient(cache_dir=base / "memory") as client:
             client.set_config_json(config, replace=True)
@@ -104,8 +132,8 @@ def run(model: str) -> None:
             assert_equivalent(single, batch)
 
         for rerank in ("off", "hybrid"):
-            arms = {}
-            for arm in ("single", "batch"):
+            record_arms: dict[str, list[list[RecordResult]]] = {}
+            for arm in ARMS:
                 with VexorClient(cache_dir=base / f"records-{rerank}-{arm}") as client:
                     client.set_config_json(config, replace=True)
                     handle = client.collection("documents")
@@ -114,11 +142,12 @@ def run(model: str) -> None:
                         for name, text in DOCUMENTS.items()
                     ] + [{"id": "private", "text": "private authentication token",
                           "metadata": {"tenant": "other"}}])
-                    options = {"filters": {"tenant": "allowed"}, "rerank": rerank}
-                    arms[arm] = measure_queries(
-                        handle, arm, options, f"collections/{rerank}/{arm}",
+                    record_arms[arm] = measure_queries(
+                        partial(handle.search, filters={"tenant": "allowed"}, rerank=rerank),
+                        partial(handle.search_many, filters={"tenant": "allowed"}, rerank=rerank),
+                        arm, f"collections/{rerank}/{arm}",
                     )
-            assert_equivalent(arms["single"], arms["batch"], records=True)
+            assert_equivalent(record_arms["single"], record_arms["batch"])
     print("PASS: file, memory, and filtered collection batches match single-query results.")
 
 
