@@ -98,6 +98,12 @@ vexor search "where JWT claims are validated" --path . --mode code --content
 
 ## Tips
 
+- Python integrations can submit multiple related queries with
+  `vexor.search_many([...], path=".", mode="code", include_content=True)` or
+  `client.search_many(...)`. The batch prepares the index once, embeds uncached
+  unique queries together, and returns responses in input order. Each response
+  has its own content budget. `InMemoryIndex` and collection handles also expose
+  `search_many`; this is a Python API feature, not a CLI flag or an MCP tool.
 - First time search will index files (may take a minute). Long-lived MCP or
   Python client sessions reuse mapped vectors, monitor source changes, and skip
   some snapshot scans. Watcher setup failures fall back to scanning. Separate

@@ -122,6 +122,57 @@ actually covers. A symbol too long to embed in one piece is indexed as several
 chunks that all carry its line range, so `content_start_line` can be later than
 the result's `start_line`.
 
+### Batch search
+
+`vexor.search_many(...)` and `VexorClient.search_many(...)` accept the same
+keyword arguments as `search(...)`, with a sequence of query strings in place
+of `query`. They return a `list[SearchResponse]` in input order:
+
+```python
+from vexor import VexorClient
+
+queries = ["where passwords are validated", "how database transactions commit"]
+with VexorClient() as client:
+    responses = client.search_many(queries, path=".", mode="code", include_content=True)
+    for query, response in zip(queries, responses):
+        print(query, [(hit.path, hit.content) for hit in response.results])
+```
+
+The batch resolves configuration and prepares the index once, including any
+required auto-indexing, filesystem validation, and extension/path filtering.
+It checks the query and shared embedding caches, deduplicates missing query
+texts, and submits those texts together to the embedding backend. Provider
+`batch_size` and `embed_concurrency` still control how the backend splits
+requests, so a batch does not necessarily mean one HTTP request.
+
+Queries use the existing single-query ranking rules, including all five
+rerank strategies. Rerankers still run separately for each query. Scoring
+processes one query at a time to avoid allocating a queries-by-corpus matrix.
+`content_chars_total` applies independently to each response; a large batch
+can therefore return more total text than a single search.
+
+Input and failure contracts:
+
+- Pass a sequence such as a list or tuple, not a bare string or a generator.
+  All entries must be non-empty strings after trimming whitespace. Invalid
+  input raises `VexorError` before indexing or contacting a provider.
+- An empty sequence returns `[]` without resolving config, paths, or models.
+- Duplicate queries retain their positions and own independent result objects;
+  their embeddings are only generated once per batch.
+- A provider or reranker failure raises for the call; no partial
+  result list is returned. Indexing and successful cache writes before an error
+  are retained, just as with single-query searches.
+- Embedding batches must contain one finite vector per unique input. Invalid
+  batches raise before their vectors are cached. OpenAI-compatible responses
+  must supply unique integer `index` values for all inputs; response rows are
+  reordered by those indices instead of silently misaligning queries.
+
+`InMemoryIndex.search_many(queries, ...)` provides the same ordered batch
+behavior with the keyword arguments of `InMemoryIndex.search(...)`, and
+defaults to `no_cache=True`. The file API's `temporary_index` and `no_cache`
+flags also work for batches and build the temporary index once per call.
+For caller-owned records, see [collection batches](collections.md#batch-search).
+
 ### index(...)
 
 Build or refresh the index for a directory. Accepts the same indexing and config

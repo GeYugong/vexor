@@ -97,13 +97,23 @@ class OpenAIEmbeddingBackend:
         data = getattr(response, "data", None) or []
         if not data:
             raise RuntimeError(Messages.ERROR_NO_EMBEDDINGS)
-        vectors: list[np.ndarray] = []
+        # Batch responses identify inputs by index; response order need not be
+        # input order. Never skip a missing row and shift every later query.
+        if len(data) != len(batch):
+            raise RuntimeError(Messages.ERROR_EMBEDDING_RESPONSE_INDEX)
+        vectors: dict[int, np.ndarray] = {}
         for item in data:
+            index = getattr(item, "index", None)
             embedding = getattr(item, "embedding", None)
-            if embedding is None:
-                continue
-            vectors.append(np.asarray(embedding, dtype=np.float32))
-        return vectors
+            if (
+                type(index) is not int
+                or not 0 <= index < len(batch)
+                or index in vectors
+                or embedding is None
+            ):
+                raise RuntimeError(Messages.ERROR_EMBEDDING_RESPONSE_INDEX)
+            vectors[index] = np.asarray(embedding, dtype=np.float32)
+        return [vectors[index] for index in range(len(batch))]
 
 
 def _chunk(items: Sequence[str], size: int | None) -> Iterator[Sequence[str]]:

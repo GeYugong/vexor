@@ -6,7 +6,7 @@ import contextlib
 import json
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -29,10 +29,11 @@ from ..config import (
 )
 from ..utils import build_exclude_spec, is_excluded_path, normalize_exclude_patterns
 from .cache_service import is_cache_current
+from .query_service import normalize_queries, validate_embedding_vectors
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..cache import IndexVectorCache
-    from ..search import SearchResult
+    from ..search import SearchResult, VexorSearcher
     from .freshness_service import FreshnessTracker
 
 # Chunk text is returned to callers verbatim, so it has to be capped or a single
@@ -696,20 +697,16 @@ def _build_searcher(request: SearchRequest):
     )
 
 
-def _resolve_query_vector(
+def _resolve_query_vectors(
     request: SearchRequest,
-    searcher,
+    queries: Sequence[str],
+    searcher: VexorSearcher,
     file_vectors: np.ndarray,
     *,
     index_id: object = None,
 ) -> np.ndarray:
-    """Resolve the query embedding through the cache layers.
-
-    Lookup order: per-index query cache (when *index_id* is known), shared
-    embedding cache, then a live embed call whose result is written back to
-    the caches (best effort).
-    """
-    from ..cache import (  # local import
+    """Resolve unique queries through both caches, embedding all misses together."""
+    from ..cache import (
         embedding_cache_key,
         load_embedding_cache,
         load_query_vector,
@@ -719,57 +716,74 @@ def _resolve_query_vector(
     )
 
     expected_dim = file_vectors.shape[1] if file_vectors.ndim == 2 else 0
-    query_vector = None
-    query_hash = None
-    query_text_hash = None
-    query_cache_hit = False
-    if index_id is not None and not request.no_cache:
-        query_hash = query_cache_key(request.query, request.model_name)
-        try:
-            query_vector = load_query_vector(int(index_id), query_hash)
-        except Exception:  # pragma: no cover - best-effort cache lookup
-            query_vector = None
-        if query_vector is not None and query_vector.size != expected_dim:
-            query_vector = None
-        elif query_vector is not None:
-            query_cache_hit = True
+    unique = list(dict.fromkeys(queries))
+    resolved: dict[str, np.ndarray] = {}
+    index_hits: set[str] = set()
 
-    if query_vector is None and not request.no_cache:
-        query_text_hash = embedding_cache_key(
-            request.query, dimension=request.embedding_dimensions
+    def valid(vector: np.ndarray | None) -> bool:
+        return (
+            vector is not None
+            and vector.ndim == 1
+            and vector.size == expected_dim
+            and np.isfinite(vector).all()
         )
-        cached = load_embedding_cache(
-            request.model_name, [query_text_hash], dimension=request.embedding_dimensions
-        )
-        query_vector = cached.get(query_text_hash)
-        if query_vector is not None and query_vector.size != expected_dim:
-            query_vector = None
 
-    if query_vector is None:
-        query_vector = searcher.embed_texts([request.query])[0]
+    if not request.no_cache:
+        if index_id is not None:
+            for query in unique:
+                try:
+                    vector = load_query_vector(
+                        int(index_id), query_cache_key(query, request.model_name)
+                    )
+                except Exception:  # pragma: no cover - existing best-effort query cache
+                    vector = None
+                if valid(vector):
+                    resolved[query] = vector
+                    index_hits.add(query)
+        hashes = {
+            query: embedding_cache_key(query, dimension=request.embedding_dimensions)
+            for query in unique if query not in resolved
+        }
+        if hashes:
+            cached = load_embedding_cache(
+                request.model_name, list(hashes.values()), dimension=request.embedding_dimensions
+            )
+            for query, text_hash in hashes.items():
+                vector = cached.get(text_hash)
+                if valid(vector):
+                    resolved[query] = vector
+
+    missing = [query for query in unique if query not in resolved]
+    if missing:
+        matrix = validate_embedding_vectors(searcher.embed_texts(missing), len(missing))
+        if matrix.shape[1] != expected_dim:
+            raise ValueError(
+                f"Embedding dimension mismatch: index has {expected_dim}-dim vectors, "
+                f"but query embedding is {matrix.shape[1]}-dim. "
+                f"Rebuild the index with: vexor index {request.directory}"
+            )
+        resolved.update(zip(missing, matrix, strict=True))
         if not request.no_cache:
-            if query_text_hash is None:
-                query_text_hash = embedding_cache_key(
-                    request.query, dimension=request.embedding_dimensions
-                )
-            # Cache storage is best-effort; a failure must not fail the search.
+            # Preserve search's existing best-effort cache writes. Validate the
+            # entire provider response first so a bad batch never poisons them.
             with contextlib.suppress(Exception):
                 store_embedding_cache(
                     model=request.model_name,
-                    embeddings={query_text_hash: query_vector},
+                    embeddings={
+                        embedding_cache_key(query, dimension=request.embedding_dimensions):
+                        resolved[query] for query in missing
+                    },
                     dimension=request.embedding_dimensions,
                 )
-    if (
-        not request.no_cache
-        and not query_cache_hit
-        and query_vector is not None
-        and index_id is not None
-        and query_hash is not None
-    ):
-        # Cache storage is best-effort; a failure must not fail the search.
-        with contextlib.suppress(Exception):
-            store_query_vector(int(index_id), query_hash, request.query, query_vector)
-    return query_vector
+    if not request.no_cache and index_id is not None:
+        for query in unique:
+            if query not in index_hits:
+                with contextlib.suppress(Exception):
+                    store_query_vector(
+                        int(index_id), query_cache_key(query, request.model_name),
+                        query, resolved[query],
+                    )
+    return np.vstack([resolved[query] for query in queries])
 
 
 def _chunk_meta_from_entries(chunk_entries: Sequence[dict]):
@@ -1068,10 +1082,20 @@ def _build_index_for_request(
 
 
 def perform_search(request: SearchRequest) -> SearchResponse:
+    """Execute one query through the same retrieval path as a batch."""
+    return perform_search_many(request, [request.query])[0]
+
+
+def perform_search_many(
+    request: SearchRequest, queries: Sequence[str]
+) -> list[SearchResponse]:
     """Execute the semantic search flow and return ranked results."""
 
+    queries = normalize_queries(queries)
+    if not queries:
+        return []
     if request.temporary_index or request.no_cache:
-        return _perform_search_with_temporary_index(request)
+        return _perform_search_with_temporary_index(request, queries)
 
     from ..cache import list_cache_entries, load_index_vectors  # local import
     from .index_service import IndexStatus, build_index  # local import
@@ -1100,7 +1124,7 @@ def perform_search(request: SearchRequest) -> SearchResponse:
             extensions=request.extensions,
         )
         if result.status == IndexStatus.EMPTY:
-            return _empty_response(request.directory, is_stale=False)
+            return [_empty_response(request.directory, is_stale=False) for _ in queries]
         state = load_state()
 
     if state.stale and request.auto_index:
@@ -1118,43 +1142,25 @@ def perform_search(request: SearchRequest) -> SearchResponse:
             del state
             if request.index_vector_cache is not None:
                 request.index_vector_cache.prune()
-            return _empty_response(request.directory, is_stale=False)
+            return [_empty_response(request.directory, is_stale=False) for _ in queries]
         state = load_state()
         if request.index_vector_cache is not None:
             request.index_vector_cache.prune()
 
     if not len(state.paths):
-        return _empty_response(request.directory, is_stale=state.stale)
+        return [_empty_response(request.directory, is_stale=state.stale) for _ in queries]
 
-    searcher = _build_searcher(request)
-    query_vector = _resolve_query_vector(
-        request,
-        searcher,
-        state.file_vectors,
-        index_id=state.metadata.get("index_id"),
-    )
-    results, reranker, content_budget = _rank_results(
-        request,
+    return _search_prepared(
+        request, queries,
         paths=state.paths,
         file_vectors=state.file_vectors,
-        query_vector=query_vector,
+        is_stale=state.stale,
+        index_id=state.metadata.get("index_id"),
         chunk_meta_getter=_chunk_meta_from_cache(state.chunk_ids, state.chunk_entries),
         lexical_scorer=(
-            _hybrid_scorer_from_cache(
-                state.metadata.get("index_id"), state.chunk_ids
-            )
-            if (request.rerank or "").strip().lower() == "hybrid"
-            else None
+            _hybrid_scorer_from_cache(state.metadata.get("index_id"), state.chunk_ids)
+            if (request.rerank or "").strip().lower() == "hybrid" else None
         ),
-    )
-    return SearchResponse(
-        base_path=request.directory,
-        backend=searcher.device,
-        results=results,
-        is_stale=state.stale,
-        index_empty=False,
-        reranker=reranker,
-        content_budget=content_budget,
     )
 
 
@@ -1167,36 +1173,72 @@ def search_from_vectors(
     is_stale: bool = False,
 ) -> SearchResponse:
     """Return ranked results from an in-memory index."""
+    return search_many_from_vectors(
+        request, [request.query], paths=paths, file_vectors=file_vectors,
+        metadata=metadata, is_stale=is_stale,
+    )[0]
 
-    if not len(paths):
-        return _empty_response(request.directory, is_stale=is_stale)
 
-    searcher = _build_searcher(request)
-    query_vector = _resolve_query_vector(request, searcher, file_vectors)
-    results, reranker, content_budget = _rank_results(
-        request,
-        paths=paths,
-        file_vectors=file_vectors,
-        query_vector=query_vector,
+def search_many_from_vectors(
+    request: SearchRequest,
+    queries: Sequence[str],
+    *,
+    paths: Sequence[Path],
+    file_vectors: np.ndarray,
+    metadata: dict,
+    is_stale: bool = False,
+) -> list[SearchResponse]:
+    """Search a batch against one in-memory index and one lexical scorer."""
+    queries = normalize_queries(queries)
+    if not queries:
+        return []
+    return _search_prepared(
+        request, queries, paths=paths, file_vectors=file_vectors, is_stale=is_stale,
         chunk_meta_getter=_chunk_meta_from_entries(metadata.get("chunks", [])),
         lexical_scorer=(
             _hybrid_scorer_from_entries(metadata.get("chunks", []))
-            if (request.rerank or "").strip().lower() == "hybrid"
-            else None
+            if (request.rerank or "").strip().lower() == "hybrid" else None
         ),
     )
-    return SearchResponse(
-        base_path=request.directory,
-        backend=searcher.device,
-        results=results,
-        is_stale=is_stale,
-        index_empty=False,
-        reranker=reranker,
-        content_budget=content_budget,
+
+
+def _search_prepared(
+    request: SearchRequest,
+    queries: Sequence[str],
+    *,
+    paths: Sequence[Path],
+    file_vectors: np.ndarray,
+    is_stale: bool,
+    chunk_meta_getter: Callable[[Sequence[int]], Callable[[int], dict]],
+    lexical_scorer: Callable[[Sequence[str]], dict[int, float]] | None,
+    index_id: object = None,
+) -> list[SearchResponse]:
+    if not len(paths):
+        return [_empty_response(request.directory, is_stale=is_stale) for _ in queries]
+    searcher = _build_searcher(request)
+    query_vectors = _resolve_query_vectors(
+        request, queries, searcher, file_vectors, index_id=index_id
     )
+    responses: list[SearchResponse] = []
+    # Score one query at a time: never allocate a queries x corpus score matrix.
+    # Each query also owns its result objects and its own content budget.
+    for query, vector in zip(queries, query_vectors, strict=True):
+        results, reranker, content_budget = _rank_results(
+            replace(request, query=query), paths=paths, file_vectors=file_vectors,
+            query_vector=vector, chunk_meta_getter=chunk_meta_getter,
+            lexical_scorer=lexical_scorer,
+        )
+        responses.append(SearchResponse(
+            base_path=request.directory, backend=searcher.device, results=results,
+            is_stale=is_stale, index_empty=False, reranker=reranker,
+            content_budget=content_budget,
+        ))
+    return responses
 
 
-def _perform_search_with_temporary_index(request: SearchRequest) -> SearchResponse:
+def _perform_search_with_temporary_index(
+    request: SearchRequest, queries: Sequence[str]
+) -> list[SearchResponse]:
     from .index_service import build_index_in_memory  # local import
 
     paths, file_vectors, metadata = build_index_in_memory(
@@ -1219,8 +1261,8 @@ def _perform_search_with_temporary_index(request: SearchRequest) -> SearchRespon
         no_cache=request.no_cache,
         embedding_dimensions=request.embedding_dimensions,
     )
-    return search_from_vectors(
-        request,
+    return search_many_from_vectors(
+        request, queries,
         paths=paths,
         file_vectors=file_vectors,
         metadata=metadata,

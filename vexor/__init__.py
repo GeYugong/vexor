@@ -34,6 +34,7 @@ __all__ = [
     "index",
     "index_in_memory",
     "search",
+    "search_many",
     "set_config_json",
     "set_data_dir",
 ]
@@ -56,6 +57,7 @@ _API_EXPORTS = frozenset(
         "index",
         "index_in_memory",
         "search",
+        "search_many",
         "set_config_json",
         "set_data_dir",
     }

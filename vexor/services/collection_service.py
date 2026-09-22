@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from sqlite3 import Connection
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -28,6 +30,7 @@ from ..collection_store import (
 from ..config import DEFAULT_RERANK, SUPPORTED_RERANKERS, RemoteRerankConfig
 from ..text import Messages
 from .embedding_service import embed_texts_with_cache
+from .query_service import normalize_queries, validate_embedding_vectors
 from .search_service import (
     _apply_ranking,
     _rank_documents_bm25,
@@ -38,6 +41,9 @@ from .search_service import (
 
 SUPPORTED_COLLECTION_RERANKERS = SUPPORTED_RERANKERS
 DEFAULT_COLLECTION_RERANK = DEFAULT_RERANK
+
+if TYPE_CHECKING:
+    from ..search import VexorSearcher
 
 
 @dataclass(slots=True)
@@ -272,11 +278,40 @@ def search_records(
     embedding_dimension: int | None = None,
     no_cache: bool = False,
 ) -> list[RecordResult]:
-    """Search *name*, applying metadata filters before anything is scored."""
-
+    """Search one query using the batch retrieval path."""
     clean_query = (query or "").strip()
     if not clean_query:
         raise CollectionError(Messages.ERROR_COLLECTION_QUERY_EMPTY)
+    return search_records_many(
+        name=name, queries=[clean_query], searcher=searcher, model_name=model_name,
+        provider=provider, top_k=top_k, filters=filters, rerank=rerank,
+        flashrank_model=flashrank_model, remote_rerank=remote_rerank,
+        embedding_dimension=embedding_dimension, no_cache=no_cache,
+    )[0]
+
+
+def search_records_many(
+    *,
+    name: str,
+    queries: Sequence[str],
+    searcher: VexorSearcher,
+    model_name: str,
+    provider: str,
+    top_k: int = 10,
+    filters: Mapping[str, object] | None = None,
+    rerank: str = DEFAULT_COLLECTION_RERANK,
+    flashrank_model: str | None = None,
+    remote_rerank: RemoteRerankConfig | None = None,
+    embedding_dimension: int | None = None,
+    no_cache: bool = False,
+) -> list[list[RecordResult]]:
+    """Embed queries together, then retrieve from one filtered read snapshot."""
+    try:
+        queries = normalize_queries(queries)
+    except ValueError as exc:
+        raise CollectionError(str(exc)) from exc
+    if not queries:
+        return []
     rerank_value = (rerank or DEFAULT_COLLECTION_RERANK).strip().lower()
     if rerank_value not in SUPPORTED_COLLECTION_RERANKERS:
         raise CollectionError(
@@ -286,23 +321,22 @@ def search_records(
             )
         )
     if top_k <= 0:
-        return []
+        return [[] for _ in queries]
     # Resolve the contract and embed the query before opening the snapshot:
     # embedding can be a network round trip, and holding a read transaction open
     # across it would pin the WAL for the whole call.
     info = _require_collection(name)
     _verify_contract(info, name=name, provider=provider, model_name=model_name)
 
-    query_matrix = embed_texts_with_cache(
-        searcher=searcher,
-        model_name=model_name,
-        labels=[clean_query],
-        no_cache=no_cache,
-        embedding_dimension=embedding_dimension,
-    )
-    if query_matrix.size == 0:
-        raise CollectionError(Messages.ERROR_COLLECTION_EMBED_FAILED)
-    query_vector = np.asarray(query_matrix[0], dtype=np.float32).ravel()
+    unique = list(dict.fromkeys(queries))
+    try:
+        query_matrix = validate_embedding_vectors(embed_texts_with_cache(
+            searcher=searcher, model_name=model_name, labels=unique,
+            no_cache=no_cache, embedding_dimension=embedding_dimension,
+        ), len(unique))
+    except ValueError as exc:
+        raise CollectionError(str(exc)) from exc
+    vector_by_query = dict(zip(unique, query_matrix, strict=True))
 
     # Every read below shares one snapshot. Filtering, vector loading, posting
     # loading, and the final record fetch must observe the same data: a writer
@@ -322,37 +356,66 @@ def search_records(
             name=name,
             provider=provider,
             model_name=model_name,
-            dimension=int(query_vector.shape[0]),
+            dimension=int(query_matrix.shape[1]),
         )
 
         candidate_ids = collection_store.resolve_filter_ids(info.id, filters, snapshot)
         if not candidate_ids:
-            return []
+            return [[] for _ in queries]
         record_ids, matrix = collection_store.load_vectors(
             info.id, candidate_ids, info.dimension, snapshot
         )
         if not record_ids:
-            return []
+            return [[] for _ in queries]
 
-        # Both sides are L2-normalized, so the dot product is cosine similarity.
-        scores = np.asarray(matrix @ query_vector, dtype=np.float32)
-        if rerank_value == "hybrid":
-            scores = _fuse_hybrid(
-                collection_id=info.id,
-                query=clean_query,
-                record_ids=record_ids,
-                dense_scores=scores,
-                conn=snapshot,
-            )
+        candidates_by_query: list[list[RecordResult]] = []
+        for query in queries:
+            candidates_by_query.append(_collect_candidates(
+                info=info, query=query, query_vector=vector_by_query[query],
+                record_ids=record_ids, matrix=matrix, snapshot=snapshot,
+                top_k=top_k, rerank=rerank_value,
+            ))
 
-        order = sorted(range(len(record_ids)), key=lambda idx: (-scores[idx], idx))
-        use_candidate_rerank = rerank_value in {"bm25", "flashrank", "remote"}
-        candidate_limit = (
-            _resolve_rerank_candidates(top_k) if use_candidate_rerank else top_k
+    # No provider or model calls while a read transaction pins the WAL.
+    return [
+        _rerank_candidates(
+            query, candidates, top_k=top_k, rerank=rerank_value,
+            flashrank_model=flashrank_model, remote_rerank=remote_rerank,
         )
-        candidate_rows = order[: int(candidate_limit)]
-        selected_ids = [record_ids[row] for row in candidate_rows]
-        stored = collection_store.fetch_by_ids(info.id, selected_ids, snapshot)
+        for query, candidates in zip(queries, candidates_by_query, strict=True)
+    ]
+
+
+def _collect_candidates(
+    *,
+    info: CollectionInfo,
+    query: str,
+    query_vector: np.ndarray,
+    record_ids: Sequence[int],
+    matrix: np.ndarray,
+    snapshot: Connection,
+    top_k: int,
+    rerank: str,
+) -> list[RecordResult]:
+    # Both sides are L2-normalized, so the dot product is cosine similarity.
+    scores = np.asarray(matrix @ query_vector, dtype=np.float32)
+    if rerank == "hybrid":
+        scores = _fuse_hybrid(
+            collection_id=info.id,
+            query=query,
+            record_ids=record_ids,
+            dense_scores=scores,
+            conn=snapshot,
+        )
+
+    order = sorted(range(len(record_ids)), key=lambda idx: (-scores[idx], idx))
+    use_candidate_rerank = rerank in {"bm25", "flashrank", "remote"}
+    candidate_limit = (
+        _resolve_rerank_candidates(top_k) if use_candidate_rerank else top_k
+    )
+    candidate_rows = order[: int(candidate_limit)]
+    selected_ids = [record_ids[row] for row in candidate_rows]
+    stored = collection_store.fetch_by_ids(info.id, selected_ids, snapshot)
 
     candidates: list[RecordResult] = []
     for row in candidate_rows:
@@ -367,30 +430,40 @@ def search_records(
                 score=float(scores[row]),
             )
         )
-    # Model loading and remote calls can be slow, so rerank only after the read
-    # snapshot closes instead of pinning the collection WAL for their duration.
-    if rerank_value == "bm25":
+    return candidates
+
+
+def _rerank_candidates(
+    query: str,
+    candidates: list[RecordResult],
+    *,
+    top_k: int,
+    rerank: str,
+    flashrank_model: str | None,
+    remote_rerank: RemoteRerankConfig | None,
+) -> list[RecordResult]:
+    if rerank == "bm25":
         ranking = _rank_documents_bm25(
-            clean_query,
+            query,
             [result.text for result in candidates],
             [result.score for result in candidates],
         )
         if ranking is not None:
             candidates = _apply_ranking(candidates, ranking)
-    elif rerank_value == "flashrank":
+    elif rerank == "flashrank":
         candidates = _apply_ranking(
             candidates,
             _rank_documents_flashrank(
-                clean_query,
+                query,
                 [result.text for result in candidates],
                 flashrank_model,
             ),
         )
-    elif rerank_value == "remote":
+    elif rerank == "remote":
         candidates = _apply_ranking(
             candidates,
             _rank_documents_remote(
-                clean_query,
+                query,
                 [result.text for result in candidates],
                 remote_rerank,
             ),

@@ -13,6 +13,15 @@ class Styles:
 
 
 class Messages:
+    ERROR_QUERIES_SEQUENCE = "Queries must be a sequence of strings, not a single string."
+    ERROR_QUERY_ITEM = "Query at position {position} must be a non-empty string."
+    ERROR_QUERY_VECTORS = (
+        "Invalid embeddings: expected {count} finite vectors with a non-zero width."
+    )
+    ERROR_EMBEDDING_RESPONSE_INDEX = (
+        "Invalid embedding response: expected one embedding per input with unique "
+        "integer indices from 0 to the batch size minus one."
+    )
     APP_HELP = "Vexor - A semantic search engine for files and code."
     HELP_QUERY = "Text used to semantically match files."
     HELP_SEARCH_PATH = "Root directory whose search will be performed."

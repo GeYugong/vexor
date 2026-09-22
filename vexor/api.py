@@ -52,13 +52,16 @@ from .services.index_service import (
     build_index_in_memory,
     clear_index_entries,
 )
+from .services.query_service import normalize_queries
 from .services.search_service import (
     DEFAULT_CONTENT_CHARS_PER_RESULT,
     DEFAULT_CONTENT_CHARS_TOTAL,
     SearchRequest,
     SearchResponse,
     perform_search,
+    perform_search_many,
     search_from_vectors,
+    search_many_from_vectors,
 )
 from .text import Messages
 from .utils import (
@@ -122,7 +125,68 @@ class InMemoryIndex:
         content_chars_per_result: int = DEFAULT_CONTENT_CHARS_PER_RESULT,
         content_chars_total: int = DEFAULT_CONTENT_CHARS_TOTAL,
     ) -> SearchResponse:
-        """Search against the in-memory index without touching disk."""
+        """Search against this in-memory index."""
+        request = self._search_request(
+            query,
+            top=top,
+            rerank=rerank,
+            flashrank_model=flashrank_model,
+            remote_rerank=remote_rerank,
+            no_cache=no_cache,
+            include_content=include_content,
+            content_chars_per_result=content_chars_per_result,
+            content_chars_total=content_chars_total,
+        )
+        return search_from_vectors(
+            request, paths=self.paths, file_vectors=self.vectors, metadata=self.metadata,
+        )
+
+    def search_many(
+        self,
+        queries: Sequence[str],
+        *,
+        top: int = 5,
+        rerank: str | None = None,
+        flashrank_model: str | None = None,
+        remote_rerank: RemoteRerankConfig | None = None,
+        no_cache: bool = True,
+        include_content: bool = False,
+        content_chars_per_result: int = DEFAULT_CONTENT_CHARS_PER_RESULT,
+        content_chars_total: int = DEFAULT_CONTENT_CHARS_TOTAL,
+    ) -> list[SearchResponse]:
+        """Embed a batch together and search each query against this index."""
+        queries = _normalize_queries(queries)
+        if not queries:
+            return []
+        request = self._search_request(
+            queries[0],
+            top=top,
+            rerank=rerank,
+            flashrank_model=flashrank_model,
+            remote_rerank=remote_rerank,
+            no_cache=no_cache,
+            include_content=include_content,
+            content_chars_per_result=content_chars_per_result,
+            content_chars_total=content_chars_total,
+        )
+        return search_many_from_vectors(
+            request, queries, paths=self.paths, file_vectors=self.vectors, metadata=self.metadata,
+        )
+
+    def _search_request(
+        self,
+        query: str,
+        *,
+        top: int = 5,
+        rerank: str | None = None,
+        flashrank_model: str | None = None,
+        remote_rerank: RemoteRerankConfig | None = None,
+        no_cache: bool = True,
+        include_content: bool = False,
+        content_chars_per_result: int = DEFAULT_CONTENT_CHARS_PER_RESULT,
+        content_chars_total: int = DEFAULT_CONTENT_CHARS_TOTAL,
+    ) -> SearchRequest:
+        """Validate options and construct a request for this in-memory index."""
 
         clean_query = query.strip()
         if not clean_query:
@@ -179,13 +243,7 @@ class InMemoryIndex:
             content_chars_per_result=content_chars_per_result,
             content_chars_total=content_chars_total,
         )
-        return search_from_vectors(
-            request,
-            paths=self.paths,
-            file_vectors=self.vectors,
-            metadata=self.metadata,
-            is_stale=False,
-        )
+        return request
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +437,82 @@ class VexorClient:
         )
         return _search_with_settings(
             query,
+            path=path,
+            top=top,
+            include_hidden=include_hidden,
+            respect_gitignore=respect_gitignore,
+            mode=mode,
+            recursive=recursive,
+            extensions=extensions,
+            exclude_patterns=exclude_patterns,
+            provider=provider,
+            model=model,
+            batch_size=batch_size,
+            embed_concurrency=embed_concurrency,
+            extract_concurrency=extract_concurrency,
+            extract_backend=extract_backend,
+            base_url=base_url,
+            api_key=api_key,
+            local_cuda=local_cuda,
+            embedding_dimensions=embedding_dimensions,
+            auto_index=auto_index,
+            use_config=resolved_use_config,
+            config=config,
+            temporary_index=temporary_index,
+            no_cache=no_cache,
+            include_content=include_content,
+            content_chars_per_result=content_chars_per_result,
+            content_chars_total=content_chars_total,
+            runtime_config=self._runtime_config,
+            data_dir=resolved_data_dir,
+            config_dir=resolved_config_dir,
+            cache_dir=resolved_cache_dir,
+            index_vector_cache=self._index_vector_cache,
+            freshness_tracker=self._freshness_tracker,
+        )
+
+    def search_many(
+        self,
+        queries: Sequence[str],
+        *,
+        path: Path | str = ".",
+        top: int = 5,
+        include_hidden: bool = False,
+        respect_gitignore: bool = True,
+        mode: str = "auto",
+        recursive: bool = True,
+        extensions: Sequence[str] | str | None = None,
+        exclude_patterns: Sequence[str] | str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        batch_size: int | None = None,
+        embed_concurrency: int | None = None,
+        extract_concurrency: int | None = None,
+        extract_backend: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        local_cuda: bool | None = None,
+        embedding_dimensions: int | None = None,
+        auto_index: bool | None = None,
+        use_config: bool | None = None,
+        config: Config | Mapping[str, object] | str | None = None,
+        temporary_index: bool = False,
+        no_cache: bool = False,
+        include_content: bool = False,
+        content_chars_per_result: int = DEFAULT_CONTENT_CHARS_PER_RESULT,
+        content_chars_total: int = DEFAULT_CONTENT_CHARS_TOTAL,
+        data_dir: Path | str | None = None,
+        config_dir: Path | str | None = None,
+        cache_dir: Path | str | None = None,
+    ) -> list[SearchResponse]:
+        """Search queries in order with this client's shared index and configuration."""
+
+        resolved_use_config = self.use_config if use_config is None else use_config
+        resolved_data_dir, resolved_config_dir, resolved_cache_dir = (
+            self._resolve_dir_overrides(data_dir, config_dir, cache_dir)
+        )
+        return _search_with_settings(
+            _normalize_queries(queries),
             path=path,
             top=top,
             include_hidden=include_hidden,
@@ -710,6 +844,75 @@ def search(
     )
 
 
+def search_many(
+    queries: Sequence[str],
+    *,
+    path: Path | str = ".",
+    top: int = 5,
+    include_hidden: bool = False,
+    respect_gitignore: bool = True,
+    mode: str = "auto",
+    recursive: bool = True,
+    extensions: Sequence[str] | str | None = None,
+    exclude_patterns: Sequence[str] | str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    batch_size: int | None = None,
+    embed_concurrency: int | None = None,
+    extract_concurrency: int | None = None,
+    extract_backend: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    local_cuda: bool | None = None,
+    embedding_dimensions: int | None = None,
+    auto_index: bool | None = None,
+    use_config: bool = True,
+    config: Config | Mapping[str, object] | str | None = None,
+    temporary_index: bool = False,
+    no_cache: bool = False,
+    include_content: bool = False,
+    content_chars_per_result: int = DEFAULT_CONTENT_CHARS_PER_RESULT,
+    content_chars_total: int = DEFAULT_CONTENT_CHARS_TOTAL,
+    data_dir: Path | str | None = None,
+    config_dir: Path | str | None = None,
+    cache_dir: Path | str | None = None,
+) -> list[SearchResponse]:
+    """Search queries in order, sharing index preparation and embedding cache lookups."""
+    return _search_with_settings(
+        _normalize_queries(queries),
+        path=path,
+        top=top,
+        include_hidden=include_hidden,
+        respect_gitignore=respect_gitignore,
+        mode=mode,
+        recursive=recursive,
+        extensions=extensions,
+        exclude_patterns=exclude_patterns,
+        provider=provider,
+        model=model,
+        batch_size=batch_size,
+        embed_concurrency=embed_concurrency,
+        extract_concurrency=extract_concurrency,
+        extract_backend=extract_backend,
+        base_url=base_url,
+        api_key=api_key,
+        local_cuda=local_cuda,
+        embedding_dimensions=embedding_dimensions,
+        auto_index=auto_index,
+        use_config=use_config,
+        config=config,
+        temporary_index=temporary_index,
+        no_cache=no_cache,
+        include_content=include_content,
+        content_chars_per_result=content_chars_per_result,
+        content_chars_total=content_chars_total,
+        runtime_config=_RUNTIME_CONFIG,
+        data_dir=data_dir,
+        config_dir=config_dir,
+        cache_dir=cache_dir,
+    )
+
+
 def index(
     path: Path | str = ".",
     *,
@@ -849,7 +1052,7 @@ def clear_index(
 
 
 def _search_with_settings(
-    query: str,
+    query: str | Sequence[str],
     *,
     path: Path | str,
     top: int,
@@ -883,12 +1086,15 @@ def _search_with_settings(
     cache_dir: Path | str | None,
     index_vector_cache: IndexVectorCache | None = None,
     freshness_tracker: FreshnessTracker | None = None,
-) -> SearchResponse:
+) -> SearchResponse | list[SearchResponse]:
+    queries = [query.strip()] if isinstance(query, str) else _normalize_queries(query)
+    if not queries:
+        return []
     with (
         _data_dir_context(data_dir, config_dir=config_dir, cache_dir=cache_dir),
         project_cache_context(directory := resolve_directory(path)),
     ):
-        clean_query = query.strip()
+        clean_query = queries[0]
         if not clean_query:
             raise VexorError(Messages.ERROR_EMPTY_QUERY)
         try:
@@ -952,7 +1158,9 @@ def _search_with_settings(
             index_vector_cache=index_vector_cache,
             freshness_tracker=freshness_tracker,
         )
-        return perform_search(request)
+        if isinstance(query, str):
+            return perform_search(request)
+        return perform_search_many(request, queries)
 
 
 def _index_with_settings(
@@ -1161,6 +1369,13 @@ def _clear_index_with_settings(
             exclude_patterns=normalized_excludes,
             extensions=normalized_exts,
         )
+
+
+def _normalize_queries(queries: Sequence[str]) -> list[str]:
+    try:
+        return normalize_queries(queries)
+    except ValueError as exc:
+        raise VexorError(str(exc)) from exc
 
 
 def _validate_mode(mode: str) -> str:
@@ -1463,6 +1678,46 @@ class CollectionHandle:
             return collection_service.search_records(
                 name=self.name,
                 query=query,
+                searcher=self._searcher(settings),
+                model_name=settings.model_name,
+                provider=settings.provider,
+                top_k=top_k,
+                filters=filters,
+                rerank=rerank or settings.rerank or DEFAULT_COLLECTION_RERANK,
+                flashrank_model=(
+                    flashrank_model
+                    if flashrank_model is not None
+                    else settings.flashrank_model
+                ),
+                remote_rerank=(
+                    remote_rerank
+                    if remote_rerank is not None
+                    else settings.remote_rerank
+                ),
+                embedding_dimension=settings.embedding_dimensions,
+                no_cache=self._no_cache,
+            )
+
+    def search_many(
+        self,
+        queries: Sequence[str],
+        *,
+        top_k: int = 10,
+        filters: Mapping[str, object] | None = None,
+        rerank: str | None = None,
+        flashrank_model: str | None = None,
+        remote_rerank: RemoteRerankConfig | None = None,
+    ) -> list[list[RecordResult]]:
+        """Search all queries against one filtered collection snapshot."""
+        queries = _normalize_queries(queries)
+        if not queries:
+            return []
+
+        with self._dir_context(), _collection_errors():
+            settings = self._settings()
+            return collection_service.search_records_many(
+                name=self.name,
+                queries=queries,
                 searcher=self._searcher(settings),
                 model_name=settings.model_name,
                 provider=settings.provider,

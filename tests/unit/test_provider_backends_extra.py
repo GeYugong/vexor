@@ -18,7 +18,7 @@ class DummyOpenAIClient:
 
     def create(self, *, model, input):
         data = [
-            SimpleNamespace(embedding=[float(idx), float(idx + 1)])
+            SimpleNamespace(index=idx, embedding=[float(idx), float(idx + 1)])
             for idx, _text in enumerate(input)
         ]
         return SimpleNamespace(data=data)

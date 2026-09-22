@@ -12,6 +12,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from .query_service import validate_embedding_vectors
+
 
 def embed_texts_with_cache(
     *,
@@ -35,7 +37,7 @@ def embed_texts_with_cache(
         return np.empty((0, 0), dtype=np.float32)
     if no_cache:
         vectors = searcher.embed_texts(labels)
-        return np.asarray(vectors, dtype=np.float32)
+        return validate_embedding_vectors(vectors, len(labels))
     from ..cache import embedding_cache_key, load_embedding_cache, store_embedding_cache
 
     # Include dimension in cache key to prevent cross-dimension cache pollution
@@ -50,7 +52,9 @@ def embed_texts_with_cache(
     if missing:
         missing_items = list(missing.items())
         missing_labels = [label for _, label in missing_items]
-        new_vectors = searcher.embed_texts(missing_labels)
+        new_vectors = validate_embedding_vectors(
+            searcher.embed_texts(missing_labels), len(missing_labels)
+        )
         stored: dict[str, np.ndarray] = {}
         for idx, (text_hash, _) in enumerate(missing_items):
             vector = np.asarray(new_vectors[idx], dtype=np.float32)

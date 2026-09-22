@@ -104,8 +104,11 @@ never leaving the machine.
     concurrency to reduce thread overhead and improve connection reuse.
   - Adaptive embedding batch size for remote providers (guarded by safe
     min/max and backoff on 429/413).
-  - Batch query search API to embed multiple queries per call. Client sessions
-    already reuse loaded index vectors; batching still reduces provider calls.
+  - Batch query search API (shipped): `search_many` on the module, client,
+    in-memory index, and collection handle shares index/filter preparation and
+    embeds uncached unique queries together. Collections retrieve every query
+    from one read snapshot. See the [batch API](api/python.md#batch-search)
+    and `scripts/benchmark_batch_search.py` for the real local-model comparison.
 
 ## P2 — Coverage & polish
 

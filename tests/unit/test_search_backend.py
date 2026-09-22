@@ -193,7 +193,7 @@ class FakeOpenAIEmbeddings:
         self.calls.append(list(input))
         vectors = self.batches[self.index]
         self.index += 1
-        data = [SimpleNamespace(embedding=vec) for vec in vectors]
+        data = [SimpleNamespace(index=i, embedding=vec) for i, vec in enumerate(vectors)]
         return SimpleNamespace(data=data)
 
 
@@ -270,12 +270,34 @@ def test_openai_backend_empty_texts(monkeypatch):
     assert result.shape == (0, 0)
 
 
-def test_openai_backend_skips_none_embeddings(monkeypatch):
+def test_openai_backend_restores_input_order_from_response_indices(monkeypatch):
+    client = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(
+        data=[SimpleNamespace(index=1, embedding=[0.0, 1.0]),
+              SimpleNamespace(index=0, embedding=[1.0, 0.0])],
+    )))
+    monkeypatch.setattr(openai_backend, "OpenAI", lambda **kwargs: client)
+    backend = openai_backend.OpenAIEmbeddingBackend(model_name="model", api_key="test")
+    np.testing.assert_array_equal(backend.embed(["first", "second"]), np.eye(2))
+
+
+@pytest.mark.parametrize("indices", [[0], [0, 1, 2], [0, 0], [-1, 1], [0, 2],
+                                     [0, None], [False, 1], [0.0, 1], ["0", 1]])
+def test_openai_backend_rejects_ambiguous_batch_responses(monkeypatch, indices):
+    client = SimpleNamespace(embeddings=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(
+        data=[SimpleNamespace(index=index, embedding=[1.0, 0.0]) for index in indices],
+    )))
+    monkeypatch.setattr(openai_backend, "OpenAI", lambda **kwargs: client)
+    backend = openai_backend.OpenAIEmbeddingBackend(model_name="model", api_key="test")
+    with pytest.raises(RuntimeError, match="Invalid embedding response"):
+        backend.embed(["first", "second"])
+
+
+def test_openai_backend_rejects_missing_embeddings(monkeypatch):
     class MixedEmbeddings:
         def create(self, *_args, **_kwargs):
             data = [
-                SimpleNamespace(embedding=None),
-                SimpleNamespace(embedding=[1.0, 0.0]),
+                SimpleNamespace(index=0, embedding=None),
+                SimpleNamespace(index=0, embedding=[1.0, 0.0]),
             ]
             return SimpleNamespace(data=data)
 
@@ -289,8 +311,8 @@ def test_openai_backend_skips_none_embeddings(monkeypatch):
         model_name="text-embedding-3-small",
         api_key="sk-test",
     )
-    vectors = backend.embed(["x"])
-    assert vectors.shape == (1, 2)
+    with pytest.raises(RuntimeError, match="Invalid embedding response"):
+        backend.embed(["x", "y"])
 
 
 def test_openai_backend_no_embeddings(monkeypatch):
@@ -320,7 +342,7 @@ def test_openai_backend_retries_transient_errors(monkeypatch):
             calls["count"] += 1
             if calls["count"] == 1:
                 raise DummyError()
-            data = [SimpleNamespace(embedding=[1.0, 0.0])]
+            data = [SimpleNamespace(index=0, embedding=[1.0, 0.0])]
             return SimpleNamespace(data=data)
 
     class FakeClient:

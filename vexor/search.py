@@ -17,6 +17,7 @@ from .providers.capabilities import (
     resolve_api_key,
     resolve_base_url,
 )
+from .services.query_service import validate_embedding_vectors
 from .text import Messages
 
 
@@ -89,21 +90,14 @@ class VexorSearcher:
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
         unique_texts, inverse = self._dedupe_texts(texts)
-        embeddings = self._backend.embed(unique_texts)
-        if embeddings.size == 0:
-            return embeddings
-        if embeddings.shape[0] != len(unique_texts):
-            embeddings = self._backend.embed(texts)
-            if embeddings.size == 0:
-                return embeddings
-        else:
-            if len(unique_texts) != len(texts):
-                embeddings = embeddings[inverse]
-        if embeddings.size == 0:
-            return embeddings
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = validate_embedding_vectors(
+            self._backend.embed(unique_texts), len(unique_texts)
+        )
+        if len(unique_texts) != len(texts):
+            embeddings = embeddings[inverse]
+        norms = np.linalg.norm(embeddings.astype(np.float64), axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        return embeddings / norms
+        return (embeddings / norms).astype(np.float32)
 
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
         """Public helper to encode arbitrary text batches."""

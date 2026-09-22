@@ -100,6 +100,10 @@ Configuration follows the same global and project-level resolution as the CLI.
 For runtime overrides, cache controls, and per-call options, see
 [`docs/api/python.md`](https://github.com/scarletkc/vexor/tree/main/docs/api/python.md).
 
+For multiple related queries, `search_many(["config loader", "database transactions"], path=".")`
+shares index preparation and batches uncached query embeddings. It is also available on
+`VexorClient`, in-memory indexes, and collection handles.
+
 ## AI Agent Skill
 
 This repo includes a skill for AI agents to use Vexor effectively:
