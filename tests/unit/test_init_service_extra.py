@@ -171,7 +171,10 @@ def test_alias_helpers_and_prompt_alias_setup(monkeypatch, tmp_path):
     monkeypatch.setenv("SHELL", "/usr/bin/fish")
     assert init_service._detect_shell_name() == "fish"
     monkeypatch.setenv("SHELL", "/bin/unknown")
-    monkeypatch.setattr(init_service.os, "name", "posix", raising=False)
+    # Patching the process-wide os.name makes pathlib and pytest fail on Windows.
+    monkeypatch.setattr(
+        init_service, "os", SimpleNamespace(name="posix", environ=init_service.os.environ)
+    )
     assert init_service._detect_shell_name() is None
 
     assert "vexor" in init_service._resolve_alias_command("fish")
