@@ -104,11 +104,6 @@ never leaving the machine.
     concurrency to reduce thread overhead and improve connection reuse.
   - Adaptive embedding batch size for remote providers (guarded by safe
     min/max and backoff on 429/413).
-  - Batch query search API (shipped): `search_many` on the module, client,
-    in-memory index, and collection handle shares index/filter preparation and
-    embeds uncached unique queries together. Collections retrieve every query
-    from one read snapshot. See the [batch API](api/python.md#batch-search)
-    and `scripts/benchmark_batch_search.py` for the real local-model comparison.
 
 ## P2 — Coverage & polish
 
@@ -171,13 +166,10 @@ never leaving the machine.
 
 ## Engineering TODO
 
-- Harden `embed_texts_with_cache` for its indexing and collection-upsert
-  consumers by validating the assembled batch, including cache hits. Add
-  regression tests for cached non-finite values and incompatible vector widths,
-  with both full cache hits and mixed hits/misses. This unchecked shared-helper
-  path predates batch search; file queries already reject invalid cache hits
-  and collection queries validate the assembled matrix. See the
-  [PR #70 review](https://github.com/scarletkc/vexor/pull/70#pullrequestreview-5279489107).
+- Validate the assembled batch, including cache hits, in
+  [`embed_texts_with_cache`](../vexor/services/embedding_service.py). Cover cached
+  non-finite values and incompatible vector widths in full-hit and mixed-hit
+  regression tests for indexing and collection upserts.
 - Add a dev-only consistency test that validates the MCP tool
   `inputSchema` against the server-side argument validation (feed
   known-good/bad payloads through both), so the advertised schema and the

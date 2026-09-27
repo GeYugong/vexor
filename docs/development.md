@@ -50,14 +50,12 @@ uv sync --extra local
 uv run --extra local python scripts/benchmark_batch_search.py
 ```
 
-This uses synthetic documents in temporary cache directories. File and filtered
-collection results are checked for equivalence under dense (`off`) and hybrid
-ranking; the in-memory comparison covers hybrid only.
-It reports elapsed time and real embedding backend call counts;
-model/index warmup is excluded and each persisted arm starts with a cold query
-cache. It uses `intfloat/multilingual-e5-small` by default (`--model` overrides
-it). Download the model first for an offline run, then set `HF_HUB_OFFLINE=1`.
-Timing is diagnostic, not a CI threshold or a retrieval-quality benchmark.
+The benchmark checks result equivalence on synthetic documents: files and filtered
+collections use `off` and `hybrid`; in-memory search uses `hybrid`. It reports
+embedding calls and elapsed time with cold query caches, excluding initial
+indexing and model warmup. Per-search model initialization remains included.
+Use `--model` to select a model; download it before setting `HF_HUB_OFFLINE=1`
+for an offline run. Timing is diagnostic, not a CI or retrieval-quality gate.
 
 Ranking changes are argued with numbers, not intuition. Two scripts score the
 same 30-query set in `scripts/eval_queries.jsonl` against whatever provider the

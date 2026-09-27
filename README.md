@@ -87,7 +87,7 @@ Useful for CI warmup or when `auto_index` is disabled.
 Vexor can also be imported and used directly from Python:
 
 ```python
-from vexor import index, search, search_many
+from vexor import index, search
 
 index(path=".", mode="head")
 response = search("config loader", path=".", mode="name")
@@ -99,10 +99,6 @@ for hit in response.results:
 Configuration follows the same global and project-level resolution as the CLI.
 For runtime overrides, cache controls, and per-call options, see
 [`docs/api/python.md`](https://github.com/scarletkc/vexor/tree/main/docs/api/python.md).
-
-For multiple related queries, `search_many(["config loader", "database transactions"], path=".")`
-shares index preparation and batches uncached query embeddings. It is also available on
-`VexorClient`, in-memory indexes, and collection handles.
 
 ## AI Agent Skill
 

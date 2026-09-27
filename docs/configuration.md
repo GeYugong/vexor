@@ -160,6 +160,11 @@ Vexor supports both remote API providers (`openai`, `gemini`, `voyageai`,
 - `custom` is OpenAI-compatible and requires both `model` and `base_url`.
 - Local provider ignores `api_key/base_url` and only uses `model` plus `local_cuda` (CPU/GPU switch).
 
+Embedding providers must return one non-empty, finite vector per input, with a
+consistent vector width. Invalid responses raise before their vectors are cached.
+OpenAI-compatible responses must identify each input exactly once with its integer
+`index`.
+
 ## Embedding Dimensions
 
 Embedding dimensions are optional. If unset, the provider/model default is

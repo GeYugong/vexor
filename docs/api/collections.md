@@ -104,11 +104,12 @@ time boundary when the application naturally has one.
 
 ## Batch search
 
-`CollectionHandle.search_many(queries, *, top_k=10, filters=None, rerank=None,
-flashrank_model=None, remote_rerank=None)` returns a `list[list[RecordResult]]`
-with one result list per input query, in input order:
+`CollectionHandle.search_many(queries, ...)` accepts the options of `search()`
+and returns a `list[list[RecordResult]]` in query order:
 
 ```python
+from vexor import VexorClient
+
 with VexorClient() as client:
     messages = client.collection("chat-history")
     results_by_query = messages.search_many(
@@ -118,20 +119,12 @@ with VexorClient() as client:
     )
 ```
 
-All queries share the same filter and ranking options. Their uncached unique
-texts are embedded together before opening a database read transaction. The
-batch resolves the filter and loads vectors once; scoring, BM25 postings, and
-record text for every query come from one snapshot. A concurrent writer cannot
-change the tenant or record contents halfway through that batch. FlashRank
-model loading and remote reranking happen after the snapshot closes.
+Queries share filter and ranking options and read from one collection snapshot,
+so concurrent writes do not change results partway through the batch.
 
-The input and failure contracts match [file batches](python.md#batch-search):
-empty sequences return `[]`, invalid entries raise `VexorError` before any
-provider call, duplicate queries keep independent results, and errors raise
-instead of returning a partial batch. An empty filtered subset produces one
-empty list per query. Each response uses the same ranking rules as `search`;
-the handle's `no_cache` option applies to all query embeddings in the batch.
-Reranker calls remain per query, and provider batch limits still apply.
+The [batch input and failure rules](python.md#batch-search) also apply here.
+An empty filtered subset returns one empty list per query. The handle's
+`no_cache` setting applies to all query embeddings.
 
 ## Worked example: database-backed chat history
 
