@@ -59,6 +59,9 @@ provider calls when the model is remote. Record the table in the PR, and keep
 the query set fixed while comparing arms — 30 queries is small enough that one
 rank change moves MRR@10 by about 0.03.
 
+For retrieval comparisons scored against returned source evidence, see
+[Retrieval evaluation](evaluation.md).
+
 ## Releases
 
 Bump the version on a branch and land it through a PR; merging to `main`
