@@ -83,6 +83,10 @@ never leaving the machine.
   grep-only workflows (30–50 QA tasks), feature the chart in the README.
   Benchmarks are what make these tools travel (see mgrep's launch).
   `scripts/eval_hybrid.py` and `scripts/eval_queries.jsonl` are the seed.
+  - Run paired agent tasks and measure usage using the
+    [agent evaluation protocol](agent-evaluation.md). Extend the
+    [retrieval suite](evaluation.md#extend-the-suite) with held-out corpora and
+    independently reviewed evidence labels.
 
 ## P1 — Performance & experience
 
